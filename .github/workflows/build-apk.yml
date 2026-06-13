@@ -1,5 +1,8 @@
 name: Build Debug APK
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 on:
   push:
     branches:
@@ -18,11 +21,11 @@ jobs:
     steps:
       # 1. Checkout code
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       # 2. Set up JDK 17 (required by this project's Gradle config)
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v4.7.1
         with:
           java-version: '17'
           distribution: 'temurin'
@@ -30,7 +33,7 @@ jobs:
 
       # 3. Cache Gradle dependencies for faster builds
       - name: Cache Gradle packages
-        uses: actions/cache@v4
+        uses: actions/cache@v4.2.3
         with:
           path: |
             ~/.gradle/caches
@@ -51,7 +54,7 @@ jobs:
 
       # 6. Upload APK as a downloadable artifact (available for 7 days)
       - name: Upload Debug APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: AABrowser-driving-bypass-debug
           path: app/build/outputs/apk/debug/app-debug.apk
