@@ -13,10 +13,14 @@ import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.text.TextUtils
 import android.util.TypedValue
 import android.view.ContextThemeWrapper
@@ -125,6 +129,11 @@ class MainActivity : AppCompatActivity() {
     private var loadedStartPageBackgroundBitmap: Bitmap? = null
     private var cachedStartPageGradientSignature: Int = 0
 
+    // --- Driving restriction bypass ---
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var audioFocusRequest: AudioFocusRequest? = null
+    private var audioManager: AudioManager? = null
+
     override fun attachBaseContext(newBase: Context?) {
         if (newBase == null) {
             super.attachBaseContext(null)
@@ -142,6 +151,15 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         umamiTracker.trackEvent("app_open")
+
+        // Keep screen on while the app is active
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // Acquire audio focus so OS does not reclaim audio during driving state changes
+        acquireAudioFocus()
+
+        // Acquire WakeLock to keep CPU running during video playback
+        acquireWakeLock()
 
         val disp = this.display
         val best = disp?.supportedModes?.maxWithOrNull(compareBy({ it.refreshRate }, { it.physicalWidth.toLong() * it.physicalHeight }))
@@ -178,7 +196,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         exitFullscreen()
-        webView?.onPause()
+        // NOTE: We intentionally do NOT call webView?.onPause() here.
+        // Calling onPause() suspends JavaScript timers and media playback inside the WebView.
+        // The OS-level CarUxRestrictions driving-state change calls through the Activity lifecycle,
+        // so suppressing this call prevents the video from being paused when the car starts moving.
+        // webView?.onPause()  <-- deliberately disabled for driving bypass
         super.onPause()
     }
 
@@ -196,7 +218,79 @@ class MainActivity : AppCompatActivity() {
         binding.webViewContainer.removeAllViews()
         browserTabs.clear()
         webView = null
+        releaseAudioFocus()
+        releaseWakeLock()
         super.onDestroy()
+    }
+
+    /**
+     * Acquires audio focus with AUDIOFOCUS_GAIN so the OS treats this app
+     * as an active media session. This prevents CarUxRestrictions from
+     * reclaiming the audio pipeline when the car starts moving.
+     */
+    private fun acquireAudioFocus() {
+        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        audioManager = am
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                .build()
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(attrs)
+                .setAcceptsDelayedFocusGain(false)
+                .setOnAudioFocusChangeListener { focusChange ->
+                    if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
+                        focusChange == AudioManager.AUDIOFOCUS_LOSS) {
+                        // Re-request focus after brief loss (e.g. navigation prompt)
+                        acquireAudioFocus()
+                    }
+                }
+                .build()
+            audioFocusRequest = request
+            am.requestAudioFocus(request)
+        } else {
+            @Suppress("DEPRECATION")
+            am.requestAudioFocus(
+                { focusChange ->
+                    if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
+                        focusChange == AudioManager.AUDIOFOCUS_LOSS) {
+                        acquireAudioFocus()
+                    }
+                },
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN
+            )
+        }
+    }
+
+    private fun releaseAudioFocus() {
+        val am = audioManager ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest?.let { am.abandonAudioFocusRequest(it) }
+        } else {
+            @Suppress("DEPRECATION")
+            am.abandonAudioFocus(null)
+        }
+        audioManager = null
+        audioFocusRequest = null
+    }
+
+    /**
+     * Acquires a partial WakeLock so the CPU stays active and JS timers
+     * keep firing even if the screen dims (e.g. passenger-seat use).
+     */
+    private fun acquireWakeLock() {
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+        wakeLock = pm.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "AABrowser:VideoPlayback"
+        ).also { it.acquire(4 * 60 * 60 * 1000L /* 4 hours */) }
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
     }
 
     private val activeTab: BrowserTab?

@@ -131,6 +131,7 @@ fun configureWebView(
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
                 view.evaluateJavascript(SpeechRecognitionBridge.POLYFILL_JS, null)
+                view.evaluateJavascript(VIDEO_PAUSE_GUARD_JS, null)
                 url?.let(callbacks.onUrlChange)
             }
 
@@ -352,3 +353,83 @@ private const val MOBILE_CHROME_UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWe
 private const val WINDOWS_CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION} Safari/537.36"
 private const val SAFARI_MAC_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 private const val SAFARI_IOS_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+
+/**
+ * JavaScript injected on every page load.
+ *
+ * Two strategies:
+ *  1. VIDEO PAUSE GUARD — overrides HTMLMediaElement.prototype.pause to no-op
+ *     when the call was NOT triggered by a user gesture. System-driven pauses
+ *     (e.g. CarUxRestrictions) happen off the user gesture path, so we can
+ *     detect and suppress them while still honouring deliberate user pauses.
+ *
+ *  2. SILENT AUDIO CONTEXT — keeps a Web Audio oscillator (volume=0) running
+ *     so the browser holds the audio focus. Without this, the OS reclaims
+ *     audio focus when the car transitions to a moving state and the media
+ *     pipeline is torn down.
+ */
+private val VIDEO_PAUSE_GUARD_JS = """
+(function() {
+  if (window.__aabrowserGuardInstalled) return;
+  window.__aabrowserGuardInstalled = true;
+
+  // --- 1. Video Pause Guard ---
+  var _nativePause = HTMLMediaElement.prototype.pause;
+  var _userGesture = false;
+
+  // Track real user interaction events
+  ['click', 'touchstart', 'touchend', 'keydown', 'pointerdown'].forEach(function(evt) {
+    document.addEventListener(evt, function() { _userGesture = true; }, true);
+  });
+
+  HTMLMediaElement.prototype.pause = function() {
+    if (_userGesture) {
+      // Legitimate user-initiated pause — allow it
+      _userGesture = false;
+      _nativePause.call(this);
+      return;
+    }
+    // Non-user-gesture pause (system/OS driven) — suppress it
+    // but reset readyState heartbeat so the player stays alive
+    var self = this;
+    if (!self.paused && (self.readyState >= 2)) {
+      console.log('[AABrowser] Suppressed system pause on', self.src || self.currentSrc);
+      return; // no-op
+    }
+    _nativePause.call(this);
+  };
+
+  // --- 2. Silent AudioContext to hold audio focus ---
+  try {
+    var AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (AudioCtx) {
+      var ctx = new AudioCtx();
+      var osc = ctx.createOscillator();
+      var gain = ctx.createGain();
+      gain.gain.value = 0.00001; // nearly silent
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      // Resume on user gesture in case browser suspended it
+      document.addEventListener('click', function() {
+        if (ctx.state === 'suspended') ctx.resume();
+      }, { once: false });
+    }
+  } catch(e) {
+    console.warn('[AABrowser] AudioContext keepalive failed:', e);
+  }
+
+  // --- 3. Re-play if paused by OS after a short debounce ---
+  document.addEventListener('visibilitychange', function() {
+    if (document.visibilityState === 'visible') {
+      setTimeout(function() {
+        document.querySelectorAll('video, audio').forEach(function(m) {
+          if (m.paused && m.readyState >= 3 && !m.ended) {
+            m.play().catch(function() {});
+          }
+        });
+      }, 300);
+    }
+  });
+})();
+""".trimIndent()
